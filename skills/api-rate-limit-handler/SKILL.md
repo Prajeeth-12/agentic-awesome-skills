@@ -1,6 +1,6 @@
 ---
 name: api-rate-limit-handler
-description: "Implement robust API rate limiting, exponential backoff, and retry logic to handle 429/5xx responses gracefully."
+description: "Implement bounded, idempotency-aware API throttling, backoff, and retry handling for 429 and transient 5xx responses."
 category: development
 risk: safe
 source: self
@@ -44,33 +44,43 @@ Determine whether a failed request is retryable or terminal.
 Always check upstream hints before computing your own delay.
 
 ```typescript
-function getRetryDelay(response: Response, attempt: number): number {
+function getRetryDelay(
+  response: Response,
+  attempt: number,
+  maxDelayMs = 60_000
+): number {
   // Prefer upstream hints
   const retryAfter = response.headers.get("Retry-After");
   if (retryAfter) {
     const seconds = Number(retryAfter);
-    if (!isNaN(seconds)) return seconds * 1000;
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(seconds * 1000, maxDelayMs);
+    }
     // HTTP-date format
     const date = new Date(retryAfter).getTime();
-    if (!isNaN(date)) return Math.max(0, date - Date.now());
+    if (Number.isFinite(date)) {
+      return Math.min(Math.max(0, date - Date.now()), maxDelayMs);
+    }
   }
 
-  // Provider-specific reset headers (OpenAI, GitHub, etc.)
-  const resetMs = response.headers.get("x-ratelimit-reset-requests")
-    || response.headers.get("x-ratelimit-reset");
-  if (resetMs) {
-    const resetTime = Number(resetMs) * 1000;
-    if (resetTime > Date.now()) return resetTime - Date.now();
+  // GitHub documents x-ratelimit-reset as Unix epoch seconds.
+  const githubReset = Number(response.headers.get("x-ratelimit-reset"));
+  if (Number.isFinite(githubReset)) {
+    return Math.min(
+      Math.max(0, githubReset * 1000 - Date.now()),
+      maxDelayMs
+    );
   }
 
-  // Fallback: exponential backoff with jitter
-  const baseDelay = 1000;
-  const maxDelay = 60000;
-  const exponential = baseDelay * Math.pow(2, attempt);
-  const jitter = Math.random() * 0.3 * exponential;
-  return Math.min(exponential + jitter, maxDelay);
+  // Fallback: capped exponential backoff with full jitter.
+  const cap = Math.min(1000 * 2 ** attempt, maxDelayMs);
+  return Math.floor(Math.random() * cap);
 }
 ```
+
+Provider-specific reset headers do not share one unit or format. For example,
+some APIs return durations while GitHub returns epoch seconds. Parse an
+additional header only after checking that provider's current documentation.
 
 ### Step 3: Implement the retry loop
 
@@ -78,8 +88,15 @@ function getRetryDelay(response: Response, attempt: number): number {
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
-  maxRetries = 3
+  maxRetries = 3,
+  maxElapsedMs = 120_000,
+  retryNonIdempotent = false
 ): Promise<Response> {
+  const startedAt = Date.now();
+  const method = (options.method ?? "GET").toUpperCase();
+  const replaySafe = ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"].includes(method)
+    || retryNonIdempotent;
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const response = await fetch(url, options);
 
@@ -90,12 +107,25 @@ async function fetchWithRetry(
       throw new Error(`Terminal error ${response.status}: ${response.statusText}`);
     }
 
+    if (!replaySafe) {
+      throw new Error(
+        `${method} was not retried because replay safety was not explicitly established`
+      );
+    }
+
     // Retryable — but exhausted attempts
     if (attempt === maxRetries) {
       throw new Error(`Failed after ${maxRetries} retries: ${response.status}`);
     }
 
-    const delay = getRetryDelay(response, attempt);
+    const remaining = maxElapsedMs - (Date.now() - startedAt);
+    const delay = Math.min(getRetryDelay(response, attempt), remaining);
+    if (delay <= 0) {
+      throw new Error(`Retry deadline exceeded after ${maxElapsedMs}ms`);
+    }
+
+    // Release the connection before waiting when the body is not needed.
+    await response.body?.cancel();
     console.warn(
       `Request failed (${response.status}), retrying in ${Math.round(delay)}ms (attempt ${attempt + 1}/${maxRetries})`
     );
@@ -114,6 +144,7 @@ Prevent hitting upstream limits in the first place with a token bucket or slidin
 class TokenBucket {
   private tokens: number;
   private lastRefill: number;
+  private queue: Promise<void> = Promise.resolve();
 
   constructor(
     private maxTokens: number,
@@ -124,6 +155,12 @@ class TokenBucket {
   }
 
   async acquire(): Promise<void> {
+    const ticket = this.queue.then(() => this.acquireOnce());
+    this.queue = ticket.catch(() => undefined);
+    return ticket;
+  }
+
+  private async acquireOnce(): Promise<void> {
     this.refill();
     if (this.tokens < 1) {
       const waitMs = ((1 - this.tokens) / this.refillRate) * 1000;
@@ -152,22 +189,25 @@ async function rateLimitedFetch(url: string, options: RequestInit) {
 
 ## Examples
 
-### Example 1: OpenAI API with retry
+### Example 1: Idempotent API read with retry
 
 ```typescript
 const response = await fetchWithRetry(
-  "https://api.openai.com/v1/chat/completions",
+  "https://api.github.com/repos/OWNER/REPO",
   {
-    method: "POST",
+    method: "GET",
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
+      "Accept": "application/vnd.github+json",
+      "Authorization": `Bearer ${githubToken}`,
     },
-    body: JSON.stringify({ model: "gpt-4", messages }),
   },
-  5 // more retries for LLM APIs which throttle aggressively
+  3
 );
 ```
+
+For a POST or another operation with side effects, leave
+`retryNonIdempotent` false unless the provider documents an idempotency
+mechanism and the same stable idempotency key is reused for every attempt.
 
 ### Example 2: Python implementation
 
@@ -209,6 +249,7 @@ def fetch_with_retry(url: str, max_retries: int = 3, **kwargs) -> httpx.Response
 - ✅ Log every retry with status code, delay, and attempt number for debugging
 - ✅ Set a maximum total timeout to avoid hanging indefinitely
 - ✅ Use a client-side rate limiter proactively rather than only reacting to 429s
+- ✅ Retry state-changing requests only with a provider-documented idempotency mechanism and a stable key
 - ❌ Don't retry 4xx client errors (except 408 and 429) — fix the request instead
 - ❌ Don't use fixed delays — exponential backoff distributes load more evenly
 - ❌ Don't retry without a cap — unbounded retries can amplify outages
@@ -219,6 +260,7 @@ def fetch_with_retry(url: str, max_retries: int = 3, **kwargs) -> httpx.Response
 - This skill does not replace environment-specific validation, testing, or expert review.
 - Token bucket is approximate for distributed systems — use Redis-backed rate limiting for multi-instance deployments.
 - Some APIs use non-standard rate limit headers; check provider documentation.
+- The elapsed-time cap shown here bounds retry waits, not a single hung network call; combine it with an `AbortSignal` or client timeout.
 
 ## Common Pitfalls
 
@@ -232,7 +274,7 @@ def fetch_with_retry(url: str, max_retries: int = 3, **kwargs) -> httpx.Response
   **Solution:** Parse both formats — check if the value is numeric first, then try Date parsing.
 
 - **Problem:** Client-side limiter doesn't account for concurrent requests already in-flight.
-  **Solution:** Decrement tokens before the request, not after — use acquire-before-send pattern.
+  **Solution:** Serialize acquisition within one process, decrement before send, and use a shared distributed limiter across instances.
 
 ## Related Skills
 
