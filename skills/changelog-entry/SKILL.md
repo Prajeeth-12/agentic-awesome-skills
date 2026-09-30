@@ -2,7 +2,8 @@
 name: changelog-entry
 description: Generate a properly formatted CHANGELOG.md entry in Keep a Changelog format from a commit range or PR. Groups changes into Added/Changed/Deprecated/Removed/Fixed/Security categories and outputs a ready-to-paste block.
 risk: safe
-source: community
+source: self
+source_type: self
 date_added: "2026-09-29"
 author: community
 tags:
